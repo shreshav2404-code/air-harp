@@ -5,10 +5,9 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Air Harp — draw strings in midair</title>
 <style>
-  html,body{margin:0;height:100%;background:#05060a;overflow:hidden;font-family:system-ui,-apple-system,sans-serif;color:#eee}
-  canvas{position:fixed;inset:0;width:100%;height:100%;touch-action:none;cursor:crosshair;z-index:1}
-  /* Video stays visible (mobile browsers pause hidden muted video). Mirrored + dimmed via CSS. */
-  video{position:fixed;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1);filter:brightness(.62);pointer-events:none;z-index:0}
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,-apple-system,sans-serif;color:#eee}
+  canvas{position:fixed;inset:0;width:100%;height:100%;touch-action:none;cursor:crosshair}
+  video{position:fixed;width:1px;height:1px;opacity:0;pointer-events:none}
   #ui{position:fixed;left:12px;bottom:12px;display:flex;gap:8px;flex-wrap:wrap;z-index:2}
   button{background:rgba(255,255,255,.12);color:#fff;border:1px solid rgba(255,255,255,.28);border-radius:8px;padding:8px 12px;font-size:14px;cursor:pointer}
   button:active{background:rgba(255,255,255,.25)}
@@ -18,6 +17,20 @@
   #start h1{font-weight:600;font-size:22px;margin:0 0 10px}
   #start button{font-size:18px;padding:12px 24px;margin-top:14px}
   kbd{background:#222;border:1px solid #444;border-radius:4px;padding:0 5px;font-size:12px}
+  .mobile-only{display:none}
+
+  /* ---------- mobile only (body.mobile is set by script on phones/tablets) ---------- */
+  body.mobile{background:#05060a;overscroll-behavior:none}
+  body.mobile canvas{z-index:1}
+  /* keep the camera visible behind the canvas: phones pause hidden muted video */
+  body.mobile video{inset:0;width:100%;height:100%;opacity:1;object-fit:cover;transform:scaleX(-1);filter:brightness(.62);z-index:0}
+  body.mobile #ui{left:0;right:0;bottom:calc(14px + env(safe-area-inset-bottom));justify-content:center;gap:10px}
+  body.mobile button{padding:12px 16px;font-size:16px;border-radius:12px;background:rgba(20,20,28,.55);backdrop-filter:blur(6px)}
+  body.mobile #status{top:calc(12px + env(safe-area-inset-top));left:0;right:0;max-width:none;text-align:center;font-size:13px}
+  body.mobile #start div{padding:28px 22px}
+  body.mobile .mobile-only{display:inline-block}
+  body.mobile p.mobile-only{display:block}
+  body.mobile .desktop-only{display:none}
 </style>
 </head>
 <body>
@@ -28,14 +41,17 @@
   <button id="undo">Undo</button>
   <button id="clear">Clear</button>
   <button id="mode">Pointer: draw</button>
+  <button id="fs" class="mobile-only">Fullscreen</button>
 </div>
 <div id="start"><div>
   <h1>Air Harp</h1>
   <p><b>Pinch</b> thumb + index to start a string, move, then <b>release</b> to fix it in the air.
   Longer string = lower note.</p>
   <p><b>Swipe</b> any fingertip across a string to pluck it.</p>
-  <p style="opacity:.7;font-size:14px">No camera? Drag with mouse/touch to draw; switch the pointer to “pluck” to strum.
+  <p class="desktop-only" style="opacity:.7;font-size:14px">No camera? Drag with mouse/touch to draw; switch the pointer to “pluck” to strum.
   Keys: <kbd>Z</kbd> undo, <kbd>C</kbd> clear.</p>
+  <p class="mobile-only" style="opacity:.7;font-size:14px">Prop the phone up, front camera facing you, about an arm’s length away.
+  You can also draw strings with a finger on the screen, and switch to “pluck” to strum them.</p>
   <button id="go">Start (camera + sound)</button>
 </div></div>
 
@@ -48,9 +64,15 @@ const video = document.getElementById('v');
 const statusEl = document.getElementById('status');
 const setStatus = t => { statusEl.textContent = t; };
 
+// Phones and tablets get their own tuned path; desktop keeps the original behaviour.
+const IS_MOBILE = !!(navigator.userAgentData && navigator.userAgentData.mobile)
+  || /Android|iPhone|iPad|iPod|Mobi/i.test(navigator.userAgent)
+  || (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent)); // iPadOS
+if (IS_MOBILE) document.body.classList.add('mobile');
+
 let W = 0, H = 0;
 function resize() {
-  const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+  const dpr = Math.min(window.devicePixelRatio || 1, IS_MOBILE ? 1.5 : 2);
   W = innerWidth; H = innerHeight;
   cv.width = W * dpr; cv.height = H * dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -167,6 +189,7 @@ function pluckString(s, v, vel, now) {
     s.sparks.push({ v, dir: (i % 2 ? 1 : -1) * (0.008 + Math.random() * 0.03), life: 1 });
   }
   playNote(s.freq, vel, s.a.x + (s.b.x - s.a.x) * v);
+  if (touchPluck && navigator.vibrate) navigator.vibrate(8);   // mobile: small haptic tick on touch-pluck
 }
 
 // position along string (0..1) where the movement p1->p2 crosses it, or -1
@@ -181,7 +204,7 @@ function crossAt(p1, p2, a, b) {
 function checkPluck(prev, cur, now) {
   const speed = dist(prev, cur);
   if (speed < 3) return;                       // ignore tracking jitter
-  const vel = Math.min(1, speed / 60);
+  const vel = Math.min(1, speed / (IS_MOBILE ? 35 : 60));   // phone screens are smaller, so swipes cover fewer px
   for (const s of strings) {
     const v = crossAt(prev, cur, s.a, s.b);
     if (v >= 0) pluckString(s, v, vel, now);
@@ -243,7 +266,10 @@ function processHands(res, now) {
 
 async function startTracking() {
   setStatus('Opening camera…');
-  const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30, max: 30 } }, audio: false });
+  const videoConstraints = IS_MOBILE
+    ? { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30, max: 30 } }
+    : { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } };
+  const stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: false });
   video.srcObject = stream;
   await video.play();
   setStatus('Loading hand model…');
@@ -263,6 +289,7 @@ async function startTracking() {
 
 // ---------------- pointer fallback ----------------
 let pointerMode = 'draw';
+let touchPluck = false;
 let ptr = null;
 const modeBtn = document.getElementById('mode');
 modeBtn.onclick = () => { pointerMode = pointerMode === 'draw' ? 'pluck' : 'draw'; modeBtn.textContent = 'Pointer: ' + pointerMode; };
@@ -274,7 +301,7 @@ cv.addEventListener('pointerdown', e => {
 cv.addEventListener('pointermove', e => {
   const p = { x: e.clientX, y: e.clientY };
   if (ptr) {
-    if (pointerMode === 'pluck') checkPluck(ptr.prev, p, performance.now());
+    if (pointerMode === 'pluck') { touchPluck = IS_MOBILE; checkPluck(ptr.prev, p, performance.now()); touchPluck = false; }
     ptr.prev = p; ptr.cur = p;
   }
 });
@@ -293,6 +320,7 @@ addEventListener('keydown', e => {
 
 document.getElementById('go').onclick = async () => {
   document.getElementById('start').remove();
+  if (IS_MOBILE) keepAwake();
   try { initAudio(); await ac.resume(); } catch (err) { console.warn(err); }
   try { await startTracking(); }
   catch (err) {
@@ -342,9 +370,10 @@ function drawString(s, now) {
     ctx.strokeStyle = `hsla(${s.hue},100%,90%,0.9)`; ctx.lineWidth = 1.5; ctx.stroke();
   }
   // sparks
-  s.sparks = s.sparks.filter(sp => (sp.life -= 0.02) > 0 && sp.v > 0 && sp.v < 1);
+  // move first, then drop sparks that left the string (moving after the check let v run past the end and crash)
+  for (const sp of s.sparks) { sp.v += sp.dir; sp.life -= 0.02; }
+  s.sparks = s.sparks.filter(sp => sp.life > 0 && sp.v >= 0 && sp.v <= 1);
   for (const sp of s.sparks) {
-    sp.v += sp.dir;
     const p = pts[Math.round(sp.v * N)];
     ctx.beginPath(); ctx.arc(p.x, p.y, 1.5 + 2.5 * sp.life, 0, Math.PI * 2);
     ctx.fillStyle = `hsla(${s.hue},100%,90%,${sp.life})`; ctx.fill();
@@ -384,8 +413,53 @@ function drawHand(P) {
 let lastDetect = 0, detectCost = 0, detections = 0, fpsT = performance.now();
 
 function frame() {
-  const now = performance.now();
-  ctx.globalCompositeOperation = 'source-over';
+  // always schedule the next frame first, so one bad frame can never freeze the app
+  requestAnimationFrame(frame);
+  try {
+    const now = performance.now();
+    ctx.globalCompositeOperation = 'source-over';
+    if (IS_MOBILE) frameVideoMobile(now);
+    else frameVideoDesktop(now);
+
+    ctx.globalCompositeOperation = 'lighter';
+    for (const s of strings) drawString(s, now);
+    ctx.globalCompositeOperation = 'source-over';
+
+    for (const k in hands) {
+      const st = hands[k];
+      if (!st.visible || !st.pts) continue;
+      drawHand(st.pts);
+      if (st.pinching && st.anchor && st.pinchPos) drawPreview(st.anchor, st.pinchPos);
+    }
+    if (ptr && pointerMode === 'draw') drawPreview(ptr.start, ptr.cur);
+  } catch (err) {
+    ctx.globalCompositeOperation = 'source-over';
+    console.warn(err);
+  }
+}
+
+// Desktop: original behaviour — hidden video drawn into the canvas, detect every new frame.
+function frameVideoDesktop(now) {
+  ctx.fillStyle = '#05060a';
+  ctx.fillRect(0, 0, W, H);
+  if (video.readyState >= 2 && video.videoWidth) {
+    vRect = coverRect();
+    ctx.save();
+    ctx.translate(vRect.x + vRect.w, vRect.y);
+    ctx.scale(-1, 1);
+    ctx.drawImage(video, 0, 0, vRect.w, vRect.h);
+    ctx.restore();
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.fillRect(0, 0, W, H);
+    if (landmarker && video.currentTime !== lastVideoTime) {
+      lastVideoTime = video.currentTime;
+      try { processHands(landmarker.detectForVideo(video, now), now); } catch (err) { console.warn(err); }
+    }
+  }
+}
+
+// Mobile: video is a visible element behind a transparent canvas; detection is throttled.
+function frameVideoMobile(now) {
   ctx.clearRect(0, 0, W, H);
 
   if (video.srcObject && video.paused) video.play().catch(() => {});   // resume if the browser paused it
@@ -409,21 +483,26 @@ function frame() {
       detections = 0; fpsT = now;
     }
   }
-
-  ctx.globalCompositeOperation = 'lighter';
-  for (const s of strings) drawString(s, now);
-  ctx.globalCompositeOperation = 'source-over';
-
-  for (const k in hands) {
-    const st = hands[k];
-    if (!st.visible || !st.pts) continue;
-    drawHand(st.pts);
-    if (st.pinching && st.anchor && st.pinchPos) drawPreview(st.anchor, st.pinchPos);
-  }
-  if (ptr && pointerMode === 'draw') drawPreview(ptr.start, ptr.cur);
-
-  requestAnimationFrame(frame);
 }
+
+// ---------- mobile extras: keep screen awake, fullscreen, haptic on touch-pluck ----------
+let wakeLock = null;
+async function keepAwake() {
+  try { if ('wakeLock' in navigator && document.visibilityState === 'visible') wakeLock = await navigator.wakeLock.request('screen'); }
+  catch { /* not supported or refused — fine */ }
+}
+if (IS_MOBILE) {
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && wakeLock) keepAwake(); });
+  document.getElementById('fs').onclick = async () => {
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else await document.documentElement.requestFullscreen({ navigationUI: 'hide' });
+    } catch { /* ignore */ }
+    setTimeout(resize, 300);
+  };
+  cv.addEventListener('pointerdown', () => { if (!wakeLock) keepAwake(); }, { once: true });
+}
+
 requestAnimationFrame(frame);
 </script>
 </body>
