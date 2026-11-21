@@ -5,9 +5,10 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Air Harp — draw strings in midair</title>
 <style>
-  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,-apple-system,sans-serif;color:#eee}
-  canvas{position:fixed;inset:0;width:100%;height:100%;touch-action:none;cursor:crosshair}
-  video{position:fixed;width:1px;height:1px;opacity:0;pointer-events:none}
+  html,body{margin:0;height:100%;background:#05060a;overflow:hidden;font-family:system-ui,-apple-system,sans-serif;color:#eee}
+  canvas{position:fixed;inset:0;width:100%;height:100%;touch-action:none;cursor:crosshair;z-index:1}
+  /* Video stays visible (mobile browsers pause hidden muted video). Mirrored + dimmed via CSS. */
+  video{position:fixed;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1);filter:brightness(.62);pointer-events:none;z-index:0}
   #ui{position:fixed;left:12px;bottom:12px;display:flex;gap:8px;flex-wrap:wrap;z-index:2}
   button{background:rgba(255,255,255,.12);color:#fff;border:1px solid rgba(255,255,255,.28);border-radius:8px;padding:8px 12px;font-size:14px;cursor:pointer}
   button:active{background:rgba(255,255,255,.25)}
@@ -49,7 +50,7 @@ const setStatus = t => { statusEl.textContent = t; };
 
 let W = 0, H = 0;
 function resize() {
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
   W = innerWidth; H = innerHeight;
   cv.width = W * dpr; cv.height = H * dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -242,7 +243,7 @@ function processHands(res, now) {
 
 async function startTracking() {
   setStatus('Opening camera…');
-  const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+  const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30, max: 30 } }, audio: false });
   video.srcObject = stream;
   await video.play();
   setStatus('Loading hand model…');
@@ -378,24 +379,34 @@ function drawHand(P) {
   for (const p of P) { ctx.beginPath(); ctx.arc(p.x, p.y, 3.5, 0, Math.PI * 2); ctx.fill(); }
 }
 
+// Detection is throttled to what the device can keep up with, so slow phones
+// don't block the main thread every frame.
+let lastDetect = 0, detectCost = 0, detections = 0, fpsT = performance.now();
+
 function frame() {
   const now = performance.now();
   ctx.globalCompositeOperation = 'source-over';
-  ctx.fillStyle = '#05060a';
-  ctx.fillRect(0, 0, W, H);
+  ctx.clearRect(0, 0, W, H);
+
+  if (video.srcObject && video.paused) video.play().catch(() => {});   // resume if the browser paused it
 
   if (video.readyState >= 2 && video.videoWidth) {
     vRect = coverRect();
-    ctx.save();
-    ctx.translate(vRect.x + vRect.w, vRect.y);
-    ctx.scale(-1, 1);
-    ctx.drawImage(video, 0, 0, vRect.w, vRect.h);
-    ctx.restore();
-    ctx.fillStyle = 'rgba(0,0,0,0.35)';
-    ctx.fillRect(0, 0, W, H);
-    if (landmarker && video.currentTime !== lastVideoTime) {
+    const minGap = Math.min(80, detectCost * 1.3);
+    if (landmarker && video.currentTime !== lastVideoTime && now - lastDetect >= minGap) {
       lastVideoTime = video.currentTime;
-      try { processHands(landmarker.detectForVideo(video, now), now); } catch (err) { console.warn(err); }
+      lastDetect = now;
+      try {
+        const t0 = performance.now();
+        const res = landmarker.detectForVideo(video, now);
+        detectCost = detectCost * 0.8 + (performance.now() - t0) * 0.2;
+        processHands(res, now);
+        detections++;
+      } catch (err) { console.warn(err); }
+    }
+    if (landmarker && now - fpsT > 1000) {
+      setStatus(`Pinch to draw · swipe to pluck · tracking ${Math.round(detections * 1000 / (now - fpsT))} fps`);
+      detections = 0; fpsT = now;
     }
   }
 
