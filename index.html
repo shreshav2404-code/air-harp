@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Air Harp — draw strings in midair</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,-apple-system,sans-serif;color:#eee}
+  canvas{position:fixed;inset:0;width:100%;height:100%;touch-action:none;cursor:crosshair}
+  video{position:fixed;width:1px;height:1px;opacity:0;pointer-events:none}
+  #ui{position:fixed;left:12px;bottom:12px;display:flex;gap:8px;flex-wrap:wrap;z-index:2}
+  button{background:rgba(255,255,255,.12);color:#fff;border:1px solid rgba(255,255,255,.28);border-radius:8px;padding:8px 12px;font-size:14px;cursor:pointer}
+  button:active{background:rgba(255,255,255,.25)}
+  #status{position:fixed;top:10px;left:12px;font-size:12px;opacity:.75;z-index:2;max-width:70vw}
+  #start{position:fixed;inset:0;display:grid;place-items:center;background:rgba(0,0,0,.88);z-index:3;text-align:center}
+  #start div{max-width:440px;padding:24px;line-height:1.55}
+  #start h1{font-weight:600;font-size:22px;margin:0 0 10px}
+  #start button{font-size:18px;padding:12px 24px;margin-top:14px}
+  kbd{background:#222;border:1px solid #444;border-radius:4px;padding:0 5px;font-size:12px}
+</style>
+</head>
+<body>
+<video id="v" playsinline muted></video>
+<canvas id="c"></canvas>
+<div id="status">Not started</div>
+<div id="ui">
+  <button id="undo">Undo</button>
+  <button id="clear">Clear</button>
+  <button id="mode">Pointer: draw</button>
+</div>
+<div id="start"><div>
+  <h1>Air Harp</h1>
+  <p><b>Pinch</b> thumb + index to start a string, move, then <b>release</b> to fix it in the air.
+  Longer string = lower note.</p>
+  <p><b>Swipe</b> any fingertip across a string to pluck it.</p>
+  <p style="opacity:.7;font-size:14px">No camera? Drag with mouse/touch to draw; switch the pointer to “pluck” to strum.
+  Keys: <kbd>Z</kbd> undo, <kbd>C</kbd> clear.</p>
+  <button id="go">Start (camera + sound)</button>
+</div></div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const video = document.getElementById('v');
+const statusEl = document.getElementById('status');
+const setStatus = t => { statusEl.textContent = t; };
+
+let W = 0, H = 0;
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+addEventListener('resize', resize);
+resize();
+
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const noteName = m => NAMES[m % 12] + (Math.floor(m / 12) - 1);
+
+// ---------------- audio: Karplus–Strong plucked string ----------------
+let ac = null, master = null;
+const SCALE = [0, 2, 4, 7, 9];          // major pentatonic, so every string sounds good together
+const BASE_MIDI = 45;                    // A2 = longest string
+const STEPS = 15;                        // 3 octaves of pentatonic
+
+function initAudio() {
+  ac = new (window.AudioContext || window.webkitAudioContext)();
+  const comp = ac.createDynamicsCompressor();
+  master = ac.createGain();
+  master.gain.value = 0.8;
+  const verb = ac.createConvolver();
+  verb.buffer = makeImpulse(2.8, 2.6);
+  const wet = ac.createGain();
+  wet.gain.value = 0.35;
+  master.connect(comp);
+  master.connect(verb); verb.connect(wet); wet.connect(comp);
+  comp.connect(ac.destination);
+}
+
+function makeImpulse(sec, decay) {
+  const len = Math.floor(ac.sampleRate * sec);
+  const b = ac.createBuffer(2, len, ac.sampleRate);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = b.getChannelData(ch);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
+  }
+  return b;
+}
+
+const pluckCache = new Map();
+function pluckBuffer(freq) {
+  const key = Math.round(freq * 10);
+  if (pluckCache.has(key)) return pluckCache.get(key);
+  const sr = ac.sampleRate, n = Math.floor(sr * 3.2);
+  const buf = ac.createBuffer(1, n, sr);
+  const d = buf.getChannelData(0);
+  const p = Math.max(2, Math.round(sr / freq));
+  const ring = new Float32Array(p);
+  let s = 0;
+  for (let i = 0; i < p; i++) { s = 0.55 * s + 0.45 * (Math.random() * 2 - 1); ring[i] = s; } // softened noise burst = harp-ish
+  let idx = 0;
+  for (let i = 0; i < n; i++) {
+    const cur = ring[idx], nxt = ring[(idx + 1) % p];
+    ring[idx] = 0.9965 * 0.5 * (cur + nxt);
+    d[i] = cur;
+    idx = (idx + 1) % p;
+  }
+  const fade = Math.floor(sr * 0.25);
+  for (let i = 0; i < fade; i++) d[n - 1 - i] *= i / fade;
+  pluckCache.set(key, buf);
+  return buf;
+}
+
+function playNote(freq, vel, x) {
+  if (!ac) return;
+  const src = ac.createBufferSource();
+  src.buffer = pluckBuffer(freq);
+  const g = ac.createGain();
+  g.gain.value = 0.35 + 0.9 * vel;
+  src.connect(g);
+  if (ac.createStereoPanner) {
+    const pan = ac.createStereoPanner();
+    pan.pan.value = Math.max(-0.8, Math.min(0.8, (x / W) * 1.6 - 0.8));
+    g.connect(pan); pan.connect(master);
+  } else {
+    g.connect(master);
+  }
+  src.start();
+}
+
+function lengthToNote(len) {
+  const maxLen = Math.max(200, Math.hypot(W, H) * 0.75);
+  const t = Math.min(1, Math.max(0, (len - 50) / (maxLen - 50))); // 0 = short, 1 = long
+  const step = Math.round((1 - t) * STEPS);
+  const midi = BASE_MIDI + Math.floor(step / 5) * 12 + SCALE[step % 5];
+  return { midi, freq: 440 * Math.pow(2, (midi - 69) / 12) };
+}
+
+// ---------------- strings ----------------
+const strings = [];
+const MAX_STRINGS = 24;
+
+function addString(a, b) {
+  const len = dist(a, b);
+  if (len < 50) return;
+  const n = lengthToNote(len);
+  strings.push({
+    a: { ...a }, b: { ...b }, len, midi: n.midi, freq: n.freq,
+    hue: 170 + ((n.midi - BASE_MIDI) / 36) * 160,   // long/low = cyan, short/high = pink
+    amp: 0, phase: 0, hitAt: 0.5, sparks: [], lastPluck: 0, born: performance.now()
+  });
+  if (strings.length > MAX_STRINGS) strings.shift();
+  pluckString(strings[strings.length - 1], 0.5, 0.35, performance.now());
+}
+
+function pluckString(s, v, vel, now) {
+  if (now - s.lastPluck < 110) return;
+  s.lastPluck = now;
+  s.amp = Math.min(22, 6 + vel * 18);
+  s.hitAt = v;
+  for (let i = 0; i < 8; i++) {
+    s.sparks.push({ v, dir: (i % 2 ? 1 : -1) * (0.008 + Math.random() * 0.03), life: 1 });
+  }
+  playNote(s.freq, vel, s.a.x + (s.b.x - s.a.x) * v);
+}
+
+// position along string (0..1) where the movement p1->p2 crosses it, or -1
+function crossAt(p1, p2, a, b) {
+  const den = (p2.x - p1.x) * (b.y - a.y) - (p2.y - p1.y) * (b.x - a.x);
+  if (Math.abs(den) < 1e-9) return -1;
+  const u = ((a.x - p1.x) * (b.y - a.y) - (a.y - p1.y) * (b.x - a.x)) / den;
+  const v = ((a.x - p1.x) * (p2.y - p1.y) - (a.y - p1.y) * (p2.x - p1.x)) / den;
+  return (u >= 0 && u <= 1 && v >= 0.02 && v <= 0.98) ? v : -1;
+}
+
+function checkPluck(prev, cur, now) {
+  const speed = dist(prev, cur);
+  if (speed < 3) return;                       // ignore tracking jitter
+  const vel = Math.min(1, speed / 60);
+  for (const s of strings) {
+    const v = crossAt(prev, cur, s.a, s.b);
+    if (v >= 0) pluckString(s, v, vel, now);
+  }
+}
+
+// ---------------- hand tracking ----------------
+let landmarker = null;
+let lastVideoTime = -1;
+let vRect = null;
+const hands = {};   // keyed by handedness
+const CONNECTIONS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],[13,17],[0,17],[17,18],[18,19],[19,20]];
+
+function coverRect() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const s = Math.max(W / vw, H / vh);
+  const w = vw * s, h = vh * s;
+  return { x: (W - w) / 2, y: (H - h) / 2, w, h };
+}
+
+function processHands(res, now) {
+  const seen = new Set();
+  (res.landmarks || []).forEach((lm, i) => {
+    const key = res.handedness?.[i]?.[0]?.categoryName || ('h' + i);
+    seen.add(key);
+    const st = hands[key] || (hands[key] = { pts: null, pinching: false, anchor: null, pinchPos: null, prev: {}, visible: false });
+    const raw = lm.map(p => ({ x: vRect.x + (1 - p.x) * vRect.w, y: vRect.y + p.y * vRect.h })); // mirrored
+    st.pts = st.pts && st.visible ? raw.map((p, j) => ({ x: st.pts[j].x + (p.x - st.pts[j].x) * 0.65, y: st.pts[j].y + (p.y - st.pts[j].y) * 0.65 })) : raw;
+    st.visible = true;
+    const P = st.pts;
+    const size = dist(P[0], P[9]) || 1;
+    const pinchRatio = dist(P[4], P[8]) / size;
+    const mid = { x: (P[4].x + P[8].x) / 2, y: (P[4].y + P[8].y) / 2 };
+
+    if (!st.pinching && pinchRatio < 0.28) {
+      st.pinching = true; st.anchor = mid; st.pinchPos = mid;
+    } else if (st.pinching && pinchRatio > 0.45) {
+      st.pinching = false;
+      if (st.anchor && st.pinchPos) addString(st.anchor, st.pinchPos);
+      st.anchor = null;
+    } else if (st.pinching) {
+      st.pinchPos = mid;
+    }
+
+    const tips = st.pinching ? [12, 16, 20] : [4, 8, 12, 16, 20];
+    for (const t of [4, 8, 12, 16, 20]) {
+      if (tips.includes(t) && st.prev[t]) checkPluck(st.prev[t], P[t], now);
+      st.prev[t] = tips.includes(t) ? P[t] : null;
+    }
+  });
+  for (const k in hands) {
+    if (!seen.has(k)) {
+      const st = hands[k];
+      st.visible = false; st.prev = {}; st.pinching = false; st.anchor = null;
+    }
+  }
+}
+
+async function startTracking() {
+  setStatus('Opening camera…');
+  const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+  video.srcObject = stream;
+  await video.play();
+  setStatus('Loading hand model…');
+  const fileset = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+  const opts = delegate => ({
+    baseOptions: {
+      modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+      delegate
+    },
+    runningMode: 'VIDEO', numHands: 2,
+    minHandDetectionConfidence: 0.5, minHandPresenceConfidence: 0.5, minTrackingConfidence: 0.5
+  });
+  try { landmarker = await HandLandmarker.createFromOptions(fileset, opts('GPU')); }
+  catch { landmarker = await HandLandmarker.createFromOptions(fileset, opts('CPU')); }
+  setStatus('Pinch to draw a string · swipe to pluck');
+}
+
+// ---------------- pointer fallback ----------------
+let pointerMode = 'draw';
+let ptr = null;
+const modeBtn = document.getElementById('mode');
+modeBtn.onclick = () => { pointerMode = pointerMode === 'draw' ? 'pluck' : 'draw'; modeBtn.textContent = 'Pointer: ' + pointerMode; };
+cv.addEventListener('pointerdown', e => {
+  const p = { x: e.clientX, y: e.clientY };
+  ptr = { start: p, prev: p, cur: p };
+  cv.setPointerCapture(e.pointerId);
+});
+cv.addEventListener('pointermove', e => {
+  const p = { x: e.clientX, y: e.clientY };
+  if (ptr) {
+    if (pointerMode === 'pluck') checkPluck(ptr.prev, p, performance.now());
+    ptr.prev = p; ptr.cur = p;
+  }
+});
+cv.addEventListener('pointerup', () => {
+  if (ptr && pointerMode === 'draw') addString(ptr.start, ptr.cur);
+  ptr = null;
+});
+cv.addEventListener('pointercancel', () => { ptr = null; });
+
+document.getElementById('undo').onclick = () => strings.pop();
+document.getElementById('clear').onclick = () => { strings.length = 0; };
+addEventListener('keydown', e => {
+  if (e.key === 'z' || e.key === 'Z') strings.pop();
+  if (e.key === 'c' || e.key === 'C') strings.length = 0;
+});
+
+document.getElementById('go').onclick = async () => {
+  document.getElementById('start').remove();
+  try { initAudio(); await ac.resume(); } catch (err) { console.warn(err); }
+  try { await startTracking(); }
+  catch (err) {
+    console.warn(err);
+    setStatus('Camera/model unavailable — draw and pluck with mouse or touch');
+  }
+};
+
+// ---------------- drawing ----------------
+function drawString(s, now) {
+  const dx = s.b.x - s.a.x, dy = s.b.y - s.a.y;
+  const len = s.len, ux = dx / len, uy = dy / len, nx = -uy, ny = ux;
+  s.phase += 0.9;
+  s.amp *= 0.955;
+  const N = 48;
+  const pts = [];
+  for (let k = 0; k <= N; k++) {
+    const t = k / N;
+    // plucked shape: tent peaked at the hit point, oscillating
+    const tent = t < s.hitAt ? t / s.hitAt : (1 - t) / (1 - s.hitAt || 1);
+    const off = s.amp * (0.6 * tent + 0.4 * Math.sin(Math.PI * t)) * Math.sin(s.phase);
+    pts.push({ x: s.a.x + dx * t + nx * off, y: s.a.y + dy * t + ny * off });
+  }
+  const glow = 0.5 + Math.min(1, s.amp / 12);
+  const passes = [[12, 0.06 * glow], [5, 0.22 * glow], [1.6, 0.95]];
+  for (const [w, a] of passes) {
+    ctx.beginPath();
+    pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+    ctx.strokeStyle = w < 2 ? `hsla(${s.hue},100%,92%,${a})` : `hsla(${s.hue},100%,65%,${a})`;
+    ctx.lineWidth = w;
+    ctx.stroke();
+  }
+  // tick marks like a ruler
+  ctx.strokeStyle = `hsla(${s.hue},80%,85%,0.45)`;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let d = 18; d < len - 8; d += 18) {
+    const t = d / len, p = pts[Math.round(t * N)];
+    const h = (Math.round(d / 18) % 5 === 0) ? 7 : 4;
+    ctx.moveTo(p.x - nx * h, p.y - ny * h);
+    ctx.lineTo(p.x + nx * h, p.y + ny * h);
+  }
+  ctx.stroke();
+  // end rings
+  for (const e of [s.a, s.b]) {
+    ctx.beginPath(); ctx.arc(e.x, e.y, 5, 0, Math.PI * 2);
+    ctx.strokeStyle = `hsla(${s.hue},100%,90%,0.9)`; ctx.lineWidth = 1.5; ctx.stroke();
+  }
+  // sparks
+  s.sparks = s.sparks.filter(sp => (sp.life -= 0.02) > 0 && sp.v > 0 && sp.v < 1);
+  for (const sp of s.sparks) {
+    sp.v += sp.dir;
+    const p = pts[Math.round(sp.v * N)];
+    ctx.beginPath(); ctx.arc(p.x, p.y, 1.5 + 2.5 * sp.life, 0, Math.PI * 2);
+    ctx.fillStyle = `hsla(${s.hue},100%,90%,${sp.life})`; ctx.fill();
+  }
+  // note label
+  const m = pts[N >> 1];
+  ctx.fillStyle = `hsla(${s.hue},100%,90%,0.55)`;
+  ctx.font = '11px system-ui,sans-serif';
+  ctx.fillText(noteName(s.midi), m.x + nx * 12, m.y + ny * 12);
+}
+
+function drawPreview(a, b) {
+  const len = dist(a, b);
+  const n = lengthToNote(len);
+  ctx.setLineDash([6, 6]);
+  ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+  ctx.strokeStyle = 'rgba(255,255,255,0.7)'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.beginPath(); ctx.arc(a.x, a.y, 5, 0, Math.PI * 2); ctx.stroke();
+  if (len >= 50) {
+    ctx.fillStyle = '#fff'; ctx.font = '13px system-ui,sans-serif';
+    ctx.fillText(noteName(n.midi), b.x + 10, b.y - 10);
+  }
+}
+
+function drawHand(P) {
+  ctx.strokeStyle = 'rgba(40,220,90,0.9)'; ctx.lineWidth = 3;
+  ctx.beginPath();
+  for (const [i, j] of CONNECTIONS) { ctx.moveTo(P[i].x, P[i].y); ctx.lineTo(P[j].x, P[j].y); }
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(230,30,40,0.95)';
+  for (const p of P) { ctx.beginPath(); ctx.arc(p.x, p.y, 3.5, 0, Math.PI * 2); ctx.fill(); }
+}
+
+function frame() {
+  const now = performance.now();
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#05060a';
+  ctx.fillRect(0, 0, W, H);
+
+  if (video.readyState >= 2 && video.videoWidth) {
+    vRect = coverRect();
+    ctx.save();
+    ctx.translate(vRect.x + vRect.w, vRect.y);
+    ctx.scale(-1, 1);
+    ctx.drawImage(video, 0, 0, vRect.w, vRect.h);
+    ctx.restore();
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.fillRect(0, 0, W, H);
+    if (landmarker && video.currentTime !== lastVideoTime) {
+      lastVideoTime = video.currentTime;
+      try { processHands(landmarker.detectForVideo(video, now), now); } catch (err) { console.warn(err); }
+    }
+  }
+
+  ctx.globalCompositeOperation = 'lighter';
+  for (const s of strings) drawString(s, now);
+  ctx.globalCompositeOperation = 'source-over';
+
+  for (const k in hands) {
+    const st = hands[k];
+    if (!st.visible || !st.pts) continue;
+    drawHand(st.pts);
+    if (st.pinching && st.anchor && st.pinchPos) drawPreview(st.anchor, st.pinchPos);
+  }
+  if (ptr && pointerMode === 'draw') drawPreview(ptr.start, ptr.cur);
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
